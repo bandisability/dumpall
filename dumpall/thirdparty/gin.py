@@ -1,232 +1,181 @@
 #!/usr/bin/env python3
-"gin - a Git index file parser"
-version = "0.1.006"
-
-# https://github.com/git/git/blob/master/Documentation/technical/index-format.txt
+"""
+gin - a Git index file parser with enhanced functionality
+"""
 
 import binascii
 import collections
 import json
 import mmap
 import struct
+import argparse
+import os
+import sys
+from typing import Generator, OrderedDict
 
 
-def check(boolean, message):
-    if not boolean:
-        import sys
-
-        print("error: " + message, file=sys.stderr)
-        sys.exit(1)
+# Global version
+VERSION = "0.2.001"
 
 
-def parse(filename, pretty=True):
-    with open(filename, "rb") as o:
-        """修复Windows下git dump 出错，https://stackoverflow.com/questions/13500434/loading-file-in-memory-using-python"""
-        f = mmap.mmap(o.fileno(), 0, access=mmap.ACCESS_READ)
+class ParsingError(Exception):
+    """Custom exception for errors encountered during parsing."""
+    pass
 
-        def read(format):
-            # "All binary numbers are in network byte order."
-            # Hence "!" = network order, big endian
-            format = "! " + format
-            bytes = f.read(struct.calcsize(format))
-            return struct.unpack(format, bytes)[0]
 
-        index = collections.OrderedDict()
+class GitIndexParser:
+    """
+    Main class for parsing Git index files with enhanced features.
+    """
 
-        # 4-byte signature, b"DIRC"
-        index["signature"] = f.read(4).decode("ascii")
-        check(index["signature"] == "DIRC", "Not a Git index file,")
+    def __init__(self, filename: str, pretty: bool = True):
+        self.filename = filename
+        self.pretty = pretty
+        self.logger = Logger(enable_debug=True)
 
-        # 4-byte version number
-        index["version"] = read("I")
-        check(index["version"] in {2, 3}, "Unsupported version: %s" % index["version"])
+    def parse(self) -> Generator[OrderedDict, None, None]:
+        """Main parsing logic for Git index files."""
+        with open(self.filename, "rb") as o:
+            f = mmap.mmap(o.fileno(), 0, access=mmap.ACCESS_READ)
 
-        # 32-bit number of index entries, i.e. 4-byte
-        index["entries"] = read("I")
+            def read(format: str):
+                """Read bytes using the given struct format."""
+                format = "!" + format
+                bytes = f.read(struct.calcsize(format))
+                return struct.unpack(format, bytes)[0]
 
-        yield index
+            # Parse header
+            index = collections.OrderedDict()
+            index["signature"] = f.read(4).decode("ascii")
+            self.logger.check(index["signature"] == "DIRC", "Not a Git index file.")
 
-        for n in range(index["entries"]):
-            entry = collections.OrderedDict()
+            index["version"] = read("I")
+            self.logger.check(
+                index["version"] in {2, 3},
+                f"Unsupported version: {index['version']}",
+            )
 
-            entry["entry"] = n + 1
+            index["entries"] = read("I")
+            self.logger.info(f"Parsed header: {index}")
+            yield index
 
-            entry["ctime_seconds"] = read("I")
-            entry["ctime_nanoseconds"] = read("I")
-            if pretty:
-                entry["ctime"] = entry["ctime_seconds"]
-                entry["ctime"] += entry["ctime_nanoseconds"] / 1000000000
-                del entry["ctime_seconds"]
-                del entry["ctime_nanoseconds"]
+            # Parse entries
+            for n in range(index["entries"]):
+                entry = self._parse_entry(f, read, n + 1)
+                yield entry
 
-            entry["mtime_seconds"] = read("I")
-            entry["mtime_nanoseconds"] = read("I")
-            if pretty:
-                entry["mtime"] = entry["mtime_seconds"]
-                entry["mtime"] += entry["mtime_nanoseconds"] / 1000000000
-                del entry["mtime_seconds"]
-                del entry["mtime_nanoseconds"]
+            # Parse extensions
+            while f.tell() < (len(f) - 20):
+                extension = self._parse_extension(f, read)
+                yield extension
 
-            entry["dev"] = read("I")
-            entry["ino"] = read("I")
+            # Parse checksum
+            checksum = self._parse_checksum(f)
+            yield checksum
 
-            # 4-bit object type, 3-bit unused, 9-bit unix permission
-            entry["mode"] = read("I")
-            if pretty:
-                entry["mode"] = "%06o" % entry["mode"]
+    def _parse_entry(self, f, read, entry_number):
+        """Parses a single entry."""
+        entry = collections.OrderedDict()
+        entry["entry"] = entry_number
+        entry["ctime_seconds"] = read("I")
+        entry["ctime_nanoseconds"] = read("I")
+        entry["mtime_seconds"] = read("I")
+        entry["mtime_nanoseconds"] = read("I")
+        entry["dev"] = read("I")
+        entry["ino"] = read("I")
+        entry["mode"] = f"{read('I'):06o}"
+        entry["uid"] = read("I")
+        entry["gid"] = read("I")
+        entry["size"] = read("I")
+        entry["sha1"] = binascii.hexlify(f.read(20)).decode("ascii")
+        entry["flags"] = read("H")
+        entry["name"] = self._read_name(f, entry["flags"])
+        self.logger.debug(f"Parsed entry: {entry}")
+        return entry
 
-            entry["uid"] = read("I")
-            entry["gid"] = read("I")
-            entry["size"] = read("I")
+    def _read_name(self, f, flags):
+        """Reads the name of the entry."""
+        namelen = flags & 0xFFF
+        if namelen < 0xFFF:
+            return f.read(namelen).decode("utf-8", "replace")
+        name = []
+        while (byte := f.read(1)) != b"\x00":
+            name.append(byte)
+        return b"".join(name).decode("utf-8", "replace")
 
-            entry["sha1"] = binascii.hexlify(f.read(20)).decode("ascii")
-            entry["flags"] = read("H")
+    def _parse_extension(self, f, read):
+        """Parses an extension block."""
+        extension = collections.OrderedDict()
+        extension["signature"] = f.read(4).decode("ascii")
+        extension["size"] = read("I")
+        extension["data"] = f.read(extension["size"]).decode("utf-8", "replace")
+        self.logger.info(f"Parsed extension: {extension}")
+        return extension
 
-            # 1-bit assume-valid
-            entry["assume-valid"] = bool(entry["flags"] & (0b10000000 << 8))
-            # 1-bit extended, must be 0 in version 2
-            entry["extended"] = bool(entry["flags"] & (0b01000000 << 8))
-            # 2-bit stage (?)
-            stage_one = bool(entry["flags"] & (0b00100000 << 8))
-            stage_two = bool(entry["flags"] & (0b00010000 << 8))
-            entry["stage"] = stage_one, stage_two
-            # 12-bit name length, if the length is less than 0xFFF (else, 0xFFF)
-            namelen = entry["flags"] & 0xFFF
-
-            # 62 bytes so far
-            entrylen = 62
-
-            if entry["extended"] and (index["version"] == 3):
-                entry["extra-flags"] = read("H")
-                # 1-bit reserved
-                entry["reserved"] = bool(entry["extra-flags"] & (0b10000000 << 8))
-                # 1-bit skip-worktree
-                entry["skip-worktree"] = bool(entry["extra-flags"] & (0b01000000 << 8))
-                # 1-bit intent-to-add
-                entry["intent-to-add"] = bool(entry["extra-flags"] & (0b00100000 << 8))
-                # 13-bits unused
-                # used = entry["extra-flags"] & (0b11100000 << 8)
-                # check(not used, "Expected unused bits in extra-flags")
-                entrylen += 2
-
-            if namelen < 0xFFF:
-                entry["name"] = f.read(namelen).decode("utf-8", "replace")
-                entrylen += namelen
-            else:
-                # Do it the hard way
-                name = []
-                while True:
-                    byte = f.read(1)
-                    if byte == "\x00":
-                        break
-                    name.append(byte)
-                entry["name"] = b"".join(name).decode("utf-8", "replace")
-                entrylen += 1
-
-            padlen = (8 - (entrylen % 8)) or 8
-            nuls = f.read(padlen)
-            check(set(nuls) == {0}, "padding contained non-NUL")
-
-            yield entry
-
-        indexlen = len(f)
-        extnumber = 1
-
-        while f.tell() < (indexlen - 20):
-            extension = collections.OrderedDict()
-            extension["extension"] = extnumber
-            extension["signature"] = f.read(4).decode("ascii")
-            extension["size"] = read("I")
-
-            # Seems to exclude the above:
-            # "src_offset += 8; src_offset += extsize;"
-            extension["data"] = f.read(extension["size"])
-            extension["data"] = extension["data"].decode("iso-8859-1")
-            if pretty:
-                extension["data"] = json.dumps(extension["data"])
-
-            yield extension
-            extnumber += 1
-
+    def _parse_checksum(self, f):
+        """Parses the checksum."""
         checksum = collections.OrderedDict()
         checksum["checksum"] = True
         checksum["sha1"] = binascii.hexlify(f.read(20)).decode("ascii")
-        yield checksum
+        self.logger.info(f"Parsed checksum: {checksum}")
+        return checksum
 
-        f.close()
+
+class Logger:
+    """Simple logging utility."""
+
+    def __init__(self, enable_debug=False):
+        self.enable_debug = enable_debug
+
+    def debug(self, message):
+        if self.enable_debug:
+            print(f"[DEBUG] {message}")
+
+    def info(self, message):
+        print(f"[INFO] {message}")
+
+    def check(self, condition, message):
+        if not condition:
+            print(f"[ERROR] {message}", file=sys.stderr)
+            sys.exit(1)
 
 
 def parse_file(arg, pretty=True):
-    if pretty:
-        properties = {
-            "version": "[header]",
-            "entry": "[entry]",
-            "extension": "[extension]",
-            "checksum": "[checksum]",
-        }
-    else:
-        print("[")
-
-    for item in parse(arg, pretty=pretty):
+    """Parses a Git index file and outputs the results."""
+    parser = GitIndexParser(arg, pretty)
+    for item in parser.parse():
         if pretty:
-            for key, value in properties.items():
-                if key in item:
-                    print(value)
-                    break
-            else:
-                print("[?]")
-
-        if pretty:
-            for key, value in item.items():
-                print(" ", key, "=", value)
+            print(json.dumps(item, indent=2))
         else:
             print(json.dumps(item))
 
-        last = "checksum" in item
-        if not last:
-            if pretty:
-                print()
-            else:
-                print(",")
-
-    if not pretty:
-        print("]")
-
 
 def main():
-    import argparse
-    import os.path
-    import sys
-
-    parser = argparse.ArgumentParser(description="parse a Git index file")
-    parser.add_argument("-j", "--json", action="store_true", help="output JSON")
+    """Main function for CLI usage."""
+    parser = argparse.ArgumentParser(description="Parse a Git index file.")
+    parser.add_argument("-j", "--json", action="store_true", help="Output JSON.")
     parser.add_argument(
-        "-v", "--version", action="store_true", help="show script version number"
+        "-v", "--version", action="store_true", help="Show script version."
     )
     parser.add_argument(
-        "path", nargs="?", default=".", help="path to a Git repository or index file"
+        "path", nargs="?", default=".", help="Path to a Git repository or index file."
     )
     args = parser.parse_args()
 
     if args.version:
-        print("gin " + version)
+        print(f"gin {VERSION}")
         sys.exit()
 
-    if os.path.isdir(args.path):
-        path = os.path.join(args.path, ".git", "index")
-        if os.path.isfile(path):
-            args.path = path
-        else:
-            print("error: couldn't find a .git/index file to use", file=sys.stderr)
-            print("use -h or --help for some documentation", file=sys.stderr)
+    path = args.path
+    if os.path.isdir(path):
+        path = os.path.join(path, ".git", "index")
+        if not os.path.isfile(path):
+            print("Error: Could not find .git/index file.", file=sys.stderr)
             sys.exit(1)
 
-    if not args.path:
-        parser.print_usage()
-        sys.exit(2)
-
-    parse_file(args.path, pretty=not args.json)
+    parse_file(path, pretty=not args.json)
 
 
 if __name__ == "__main__":
     main()
+
